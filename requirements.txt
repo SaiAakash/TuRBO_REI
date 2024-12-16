@@ -1,0 +1,12 @@
+# for TuRBO-qREI
+botorch
+pandas
+matplotlib
+# for CMA-ES and HPA problems
+matplotlib>=3.7.4
+numpy>=1.24.4
+openpyxl>=3.1.2
+pandas>=2.0.3
+pymoo>=0.6.1.1
+scipy>=1.10.1
+# nothing needed for MOPTA08 and rover trajectory planning problems except for the above
