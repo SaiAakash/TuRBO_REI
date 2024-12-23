@@ -3,7 +3,7 @@
 This repository provides the source code proposed in the following article. Please cite this article if you use the code.
 
 Nobuo Namura and Sho Takemori, "Regional Expected Improvement for Efficient Trust Region Selection
-in High-Dimensional Bayesian Optimization," In Proceedings of the 39th AAAI Conference on Artificial Intelligence (2025).
+in High-Dimensional Bayesian Optimization," In Proceedings of the 39th AAAI Conference on Artificial Intelligence (2025). [[arXiv](https://arxiv.org/abs/2412.11456)]
 
 ## Requirements
 To install requirements:
