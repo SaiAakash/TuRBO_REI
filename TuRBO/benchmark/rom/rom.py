@@ -459,9 +459,6 @@ class SiROM(BaseTestProblem):
             pso_kwargs={},
         )
 
-    # def scale_params(self, value, bounds):
-    #     return bounds[0] + value * (bounds[1] - bounds[0])
-
     def scale_samples(self, samples, lower_bounds, upper_bounds):
         return qmc.scale(samples, lower_bounds, upper_bounds)
 
@@ -489,16 +486,6 @@ class SiROM(BaseTestProblem):
 
         if kwargs["scale_parameters"]:
             X = self.scale_samples(X, lower_bounds, upper_bounds)
-
-            # for i in range(X.shape[1]):
-            #     if i < 2:
-            #         X[:, i] = self.scale_params(X[:, i], self.params_range["m"])
-            #     elif i >= 2 and i < 4:
-            #         X[:, i] = self.scale_params(X[:, i], self.params_range["k"])
-            #     elif i == 4:
-            #         X[:, i] = self.scale_params(X[:, i], self.params_range["h1"])
-            #     elif i == 5:
-            #         X[:, i] = self.scale_params(X[:, i], self.params_range["h2"])
 
         # Calculate the error for each candidate
         for j in range(X.shape[0]):
