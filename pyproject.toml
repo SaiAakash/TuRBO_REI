@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "TuRBO_REI"
+version = "0.0.1"
+description = "Efficient Trust Region Selection for High-Dimensional Bayesian Optimziation."
+authors = [
+    "Sai Aakash <sai-aakash@digilab.co.uk>",
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+botorch = "^0.12.0"
+pandas = "^2.2.0"
+
+[tool.poetry.group.dev.dependencies]
+black = { version = "^24.3.0", extras = ["jupyter"] }
+flake8 = "^7.1.0"
+ipykernel = "^6.29.2"
+ipywidgets = "^8.1.2"
+matplotlib = "^3.8.3"
+radon = "^6.0.1"
+termynal = "^0.12.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -3,7 +3,6 @@ implementation of turbo based on BoTorch documentation
 """
 
 import os
-import sys
 import time
 import math
 import warnings
@@ -15,11 +14,8 @@ import pandas as pd
 import torch
 from torch.quasirandom import SobolEngine
 from botorch.acquisition.analytic import (
-    ExpectedImprovement,
     LogExpectedImprovement,
-    UpperConfidenceBound,
 )
-from botorch.acquisition.monte_carlo import qExpectedImprovement
 from botorch.acquisition.logei import qLogExpectedImprovement
 from botorch.fit import fit_gpytorch_mll
 from botorch.generation import MaxPosteriorSampling
@@ -37,7 +33,6 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
 from .rei import qRegionalExpectedImprovement, LogRegionalExpectedImprovement
-from .rucb import RegionalUpperConfidenceBound
 
 
 SMOKE_TEST = os.environ.get("SMOKE_TEST")
@@ -57,6 +52,34 @@ class TurboState:
     success_tolerance: int = 10  # Note: The original paper uses 3
     best_value: float = -float("inf")
     restart_triggered: bool = False
+    """
+    A class that maintains the state of the Trust Region(TR).
+
+    Parameters
+    __________
+    dim: int
+        The number of dimensions of the optimization problem.
+    batch_size: int
+        The number of candidates to be generated at each iteration.
+    length: float
+        The initial length of the TR.
+    length_min: float
+        The minimum length of the TR after which optimization inside this TR is terminated.
+    length_max: float
+        The maximum length of the TR.
+    failure_counter: int
+        An accumulator to count the number of failures. A failure is when the best value in the TR is not improved.
+    failure_tolerance: int
+        The number of consecutive failures before the TR is shrunk.
+    success_counter: int
+        An accumulator to count the number of successes. A success is when the best value in the TR is improved.
+    success_tolerance: int
+        The number of consecutive successes before the TR is expanded.
+    best_value: float
+        The best value found so far in the optimization routine.
+    restart_triggered: bool
+        A flag to indicate if the TR optimization needs to be restarted.
+    """
 
     def __post_init__(self):
         self.failure_tolerance = math.ceil(
@@ -71,6 +94,22 @@ class TuRBO:
         self.path_file = path
 
     def update_state(self, state, Y_next):
+        """
+        Function to update the state of the Trust Region(TR) based on the function values of the candidates evaluated inside the TR.
+
+        Parameters
+        __________
+        state: TurboState
+            The current state of the TR.
+        Y_next: torch.Tensor
+            The function values of the candidates evaluated inside the TR.
+
+        Returns
+        _______
+        state: TurboState
+            The updated state of the TR.
+        """
+        # Update counters by checking if sampled candidates improved the best value
         if max(Y_next) > state.best_value:
             state.success_counter += 1
             state.failure_counter = 0
@@ -78,19 +117,40 @@ class TuRBO:
             state.success_counter = 0
             state.failure_counter += 1
 
-        if state.success_counter == state.success_tolerance:  # Expand trust region
+        # Expand Trust Region
+        if state.success_counter == state.success_tolerance:
             state.length = min(2.0 * state.length, state.length_max)
             state.success_counter = 0
-        elif state.failure_counter == state.failure_tolerance:  # Shrink trust region
+        # Shrink Trust Region
+        elif state.failure_counter == state.failure_tolerance:
             state.length /= 2.0
             state.failure_counter = 0
 
+        # Update best value and check if restart is needed
         state.best_value = max(state.best_value, max(Y_next).item())
         if state.length < state.length_min:
             state.restart_triggered = True
         return state
 
     def get_initial_points(self, dim, n_pts, seed=0):
+        """
+        Function to sample a set of initial points for the optimization routine.
+        Uses Sobol sequences to generate these samples.
+
+        Parameters
+        __________
+        dim: int
+            The number of dimensions of the optimization problem.
+        n_pts: int
+            The number of initial points to sample.
+        seed: int
+            The seed for the random number generator.
+
+        Returns
+        _______
+        X_init: torch.Tensor
+            The initial points sampled using the Sobol Engine in Torch.
+        """
         sobol = SobolEngine(dimension=dim, scramble=True, seed=seed)
         X_init = sobol.draw(n=n_pts).to(dtype=self.dtype, device=self.device)
         return X_init
@@ -107,12 +167,44 @@ class TuRBO:
         raw_samples=512,
         acqf="TS",  # "EI" or "TS"
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Function to generate the next batch of points to be evaluated using Thompson Sampling or Expected Improvement.
+
+        Parameters
+        __________
+        state: TurboState
+            The current state of the Trust Region.
+        model: Model
+            The current surrogate model which is generally a SingleTaskGP.
+        X: torch.Tensor
+            The evaluated points on the domain [0, 1]^d.
+        Y: torch.Tensor
+            The function values of the evaluated points.
+        batch_size: int
+            The number of candidates to be generated at each iteration.
+        n_candidates: int
+            The number of samples to be generated from the posterior using Thompson Sampling.
+        num_restarts: int
+            The number of restarts for the optimization routine (optimize_acqf).
+        raw_samples: int
+            The number of base samples from the posterior to optimize MC acqusition functions.
+        acqf: str
+            The acquisition function to be used.
+            Can be "EI" (Expected Improvement) or "TS" (Thompson Sampling).
+
+        Returns
+        _______
+        X_next: torch.Tensor
+            The next batch of points to be evaluated.
+        acq_value: torch.Tensor
+            The acquisition value of the next batch of points
+        """
         assert acqf in ("TS", "EI")
         assert X.min() >= 0.0 and X.max() <= 1.0 and torch.all(torch.isfinite(Y))
         if n_candidates is None:
             n_candidates = min(5000, max(2000, 200 * X.shape[-1]))
 
-        # Scale the TR to be proportional to the lengthscales
+        # Scale the TR to be proportional to the lengthscales in the respective dimensions
         x_center = X[Y.argmax(), :].clone()
         weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
         weights = weights / weights.mean()
@@ -141,8 +233,7 @@ class TuRBO:
             X_cand = x_center.expand(n_candidates, dim).clone()
             X_cand[mask] = pert[mask]
 
-            # Sample on the candidate points
-
+            # Sample from the posterior conditioned on the candidates points
             # replacement is True for simplicity
             thompson_sampling = MaxPosteriorSampling(model=model, replacement=True)
             with torch.no_grad():
@@ -156,6 +247,7 @@ class TuRBO:
                 acq_value = torch.max(samples, dim=1)[0].reshape((-1, 1))
 
         elif acqf == "EI":
+            # If batch_size <= 1, use analytical acquisition function (LogEI here)
             if batch_size <= 1:
                 ei = LogExpectedImprovement(model, Y.max())
                 X_next, acq_value = optimize_acqf(
@@ -166,6 +258,7 @@ class TuRBO:
                     raw_samples=raw_samples,
                 )
             else:
+                # Use MC acqusition function if batch_size > 1
                 ei = qLogExpectedImprovement(model, Y.max())
                 X_next, acq_value = optimize_acqf(
                     ei,
@@ -184,6 +277,27 @@ class TuRBO:
         n_init: int,
         rng: np.random.Generator,
     ):
+        """
+        Function to evaluate the initial points sampled in the parameter space.
+
+        Parameters
+        __________
+        eval_fn: Callable
+            The callable that evaluates the objective function at a given point.
+        dim: int
+            The number of dimensions of the optimization problem.
+        n_init: int
+            The number of initial points to sample.
+        rng: np.random.Generator
+            The random number generator.
+
+        Returns
+        _______
+        X_turbo: torch.Tensor
+            The initial points sampled in the parameter space.
+        y_turbo: torch.Tensor
+            The objective function values of the initial points.
+        """
         seed = int(rng.integers(low=0, high=2**16, dtype=np.int64))
         X_turbo = self.get_initial_points(dim, n_init, seed=seed)
         y_turbo = torch.tensor(
@@ -207,11 +321,55 @@ class TuRBO:
         n_gp_max=2000,
         acqf="TS",
     ):
+        """
+        Wrapper function around generate_batch to generate the next batch of points to be evaluated inside the Trust Region.
+        This fits a GP model on the evaluated points and generates the next batch of points using Thompson Sampling or Expected Improvement.
+
+        Parameters
+        __________
+        dim: int
+            The number of dimensions of the optimization problem.
+        X_turbo: torch.Tensor
+            The evaluated points on the domain [0, 1]^d.
+        y_turbo: torch.Tensor
+            The function values of the evaluated points.
+        state: TurboState
+            The current state of the Trust Region.
+        batch_size: int
+            The number of candidates to be generated at each iteration.
+        n_candidates: int
+            The number of samples to be generated from the posterior using Thompson Sampling.
+        num_restarts: int
+            The number of restarts for the optimization routine (optimize_acqf).
+        raw_samples: int
+            The number of base samples from the posterior to optimize MC acqusition functions.
+        max_cholesky_size: int
+            Threshold below which Cholesky decomposition is used for decomposition of `LinearOperator` objects in GPyTorch.
+            Above this threshold, Lanczos/CG decomposition is used.
+        noise_constraint: Tuple
+            The lower and upper bounds of the noise level.
+        n_gp_max: int
+            <<PLACEHOLDER>>
+        acqf: str
+            The acquisition function to be used for candidate point generation.
+            Can be "EI" (Expected Improvement) or "TS" (Thompson Sampling).
+
+        Returns
+        _______
+        X_next: torch.Tensor
+            The next batch of points to be evaluated.
+        aqui_vals: torch.Tensor
+            The acquisition value of the next batch of points.
+
+        """
         mask = self.select_sample(X_turbo, y_turbo, n_gp_max)
         train_Y = (y_turbo - y_turbo.mean()) / y_turbo.std()
+
+        # Define the Likelihood of the GP Model
         likelihood = GaussianLikelihood(
             noise_constraint=Interval(noise_constraint[0], noise_constraint[1])
         )
+        # Define the Kernel function of the GP Model
         covar_module = (
             ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
                 MaternKernel(
@@ -221,6 +379,7 @@ class TuRBO:
                 )
             )
         )
+        # Define the GP model and the training objective
         model = SingleTaskGP(
             X_turbo[mask],
             train_Y[mask],
@@ -251,6 +410,18 @@ class TuRBO:
     def from_hyper_cube(
         self, x: torch.tensor, lb: np.ndarray, ub: np.ndarray
     ) -> torch.Tensor:
+        """
+        Utility function to scale the final candidate points to the ranges provided in the optimization problem
+
+        Parameters
+        __________
+        x: torch.Tensor
+            Candidates in the unit normal space
+        lb: np.ndarray
+            Dimension-wise lower bounds
+        ub: np.ndarray
+            Dimension-wise upper bounds
+        """
         if lb is None:
             return x
         else:
@@ -271,8 +442,47 @@ class TuRBO:
         racqf="qREI",
         MIN_INFERRED_NOISE_LEVEL=1e-4,
     ):
+        """
+        Function to perform trust region selection during initialization and restart phases
+        using Region-averaged acquisition functions.
+
+        Parameters
+        __________
+        X_hist: torch.Tensor
+            History of all evaluated inputs in the parameter space
+        y_hist: torch.Tensor
+            History of all evaluated objective function values
+        bounds: torch.Tensor
+            Bounds for the generated candidate points. First column corresponds to dimension-wise lower bounds.
+            Second column corresponds to dimension-wise upper bounds.
+        eval_fn: Callable
+            Objective function that maps inputs to the outputs.
+        dim: int
+            The number of dimensions of the optimization problem.
+        n_init: int
+            The number of initial points to sample.
+        rng: np.random.Generator
+            The random number generator.
+        max_cholesky_size: int
+            Threshold below which Cholesky decomposition is used for decomposition of `LinearOperator` objects in GPyTorch.
+            Above this threshold, Lanczos/CG decomposition is used.
+        length_init: float
+            Initial length of the TR.
+        q_batch: int
+            Number of candidates to sample using the Region-averaged acquisition function.
+        racqf: str
+            Region-Averaged acquisition function used to sample trust regions.
+
+        Returns
+        _______
+        X_turbo: torch.Tensor
+            Suggested TR centres
+        y_turbo: torch.Tensor
+            Objective function values at the suggested TR centres
+        """
         train_y = (y_hist - y_hist.mean()) / y_hist.std()
 
+        # Setup the Kernel function for the Global GP model
         covar_module = MaternKernel(
             nu=2.5,
             ard_num_dims=X_hist.shape[-1],
@@ -281,6 +491,8 @@ class TuRBO:
         covar_module = ScaleKernel(
             covar_module, outputscale_prior=GammaPrior(2.0, 0.15)
         )
+
+        # Setup the likelihood of the global GP model
         noise_prior = GammaPrior(1.1, 0.05)
         noise_prior_mode = (noise_prior.concentration - 1) / noise_prior.rate
         likelihood = GaussianLikelihood(
@@ -289,6 +501,8 @@ class TuRBO:
                 MIN_INFERRED_NOISE_LEVEL, transform=None, initial_value=noise_prior_mode
             ),
         )
+
+        # Initialise the global GP model and the training objective
         model = SingleTaskGP(
             X_hist,
             train_y,
@@ -302,12 +516,13 @@ class TuRBO:
         seed = int(rng.integers(low=0, high=2**16, dtype=np.int64))
         sobol = SobolEngine(dimension=dim, scramble=True, seed=seed)
         X_dev = sobol.draw(n=128).to(dtype=self.dtype, device=self.device)
-        # move to the center
+        # Move to the center
         X_dev[torch.argmin(torch.sum((X_dev - 0.5) ** 2, axis=1)), :] = 0.5
 
         with gpytorch.settings.max_cholesky_size(max_cholesky_size):
             fit_gpytorch_mll(mll)
 
+            # Pick the relevant acquisition function
             if racqf == "qREI":
                 seed = int(rng.integers(low=0, high=2**16, dtype=np.int64))
                 racq_function = qRegionalExpectedImprovement(
@@ -328,28 +543,8 @@ class TuRBO:
                     length=length_init,
                     bounds=bounds,
                 )
-            elif racqf == "EI":
-                racq_function = LogExpectedImprovement(model, train_y.max())
-            elif racqf == "qEI":
-                seed = int(rng.integers(low=0, high=2**16, dtype=np.int64))
-                racq_function = qLogExpectedImprovement(
-                    model,
-                    train_y.max(),
-                    sampler=SobolQMCNormalSampler(
-                        sample_shape=torch.Size([256]), seed=seed
-                    ),
-                )
-            elif racqf == "RUCB":
-                racq_function = RegionalUpperConfidenceBound(
-                    model=model,
-                    beta=0.1,
-                    X_dev=X_dev,
-                    length=length_init,
-                    bounds=bounds,
-                )
-            elif racqf == "UCB":
-                racq_function = UpperConfidenceBound(model, beta=0.1)
 
+            # Optimize the acquisition function to generate candidates for TR centres
             candidates, _ = optimize_acqf(
                 acq_function=racq_function,
                 bounds=bounds,
@@ -359,7 +554,7 @@ class TuRBO:
                 options={"batch_limit": 5, "maxiter": 200},
                 sequential=True,
             )
-            # observe new values
+            # Observe new values
             X_center = candidates.detach()
 
         if n_init > 1:
@@ -382,6 +577,7 @@ class TuRBO:
         else:
             X_turbo = X_center.clone()
 
+        # Evaluate the function at the suggested candidate points
         y_turbo = torch.tensor(
             [eval_fn(x) for x in X_turbo], dtype=self.dtype, device=self.device
         ).unsqueeze(-1)
@@ -391,7 +587,7 @@ class TuRBO:
     def select_sample(self, X, y, n_gp_max=2000):
         # Subsampling for GP: Normalize the objective function and design variables, calculate the distance on a log scale based on regret from the best value in the objective direction, and select using MaxMinGreedy.
         if X.shape[0] > n_gp_max:
-            # consider distance in regret dimention
+            # Consider distance in regret dimension
             y_max = y.max()
             y_min = y.min()
             regret = (y_max - y) / (y_max - y_min)
@@ -400,7 +596,7 @@ class TuRBO:
                 torch.log(1 + r_min2) - torch.log(r_min2)
             )
             XY = torch.hstack([X, regret])
-            # greedy maxmin selection
+            # Greedy maxmin selection
             mask = torch.full([XY.shape[0]], False)
             mask[regret[:, 0].argmin()] = True
             while mask.sum() < n_gp_max:
@@ -428,18 +624,22 @@ class TuRBO:
         verbose: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        def eval_objective(x):
-            """This is a helper function we use to unnormalize and evalaute a point"""
-            return fun(unnormalize(x, fun.bounds))
+        # def eval_objective(x):
+        #     """This is a helper function we use to unnormalize and evalaute a point"""
+        #     return fun(unnormalize(x, fun.bounds))
 
+        def eval_objective(x):
+            return fun(x)
+
+        # Perform fundamental checks regarding acquisition functions
         if n_init_region > 0 and n_trust_regions > 1:
             assert (
                 racqf in ("qREI", "qEI") or racqf is None
             ), "racqf must be 'qREI', 'qEI', or None for TuRBO-m"
         else:
             assert (
-                racqf in ("REI", "qREI", "EI", "qEI", "RUCB", "UCB") or racqf is None
-            ), "racqf must be 'REI', 'qREI', 'EI', 'qEI', 'RUCB', 'UCB', or None"
+                racqf in ("REI", "qREI") or racqf is None
+            ), "racqf must be 'REI', 'qREI', or None"
 
         t0 = time.perf_counter()
 
@@ -449,20 +649,21 @@ class TuRBO:
             device=self.device, dtype=self.dtype
         )
 
+        # Setup tensors to store all candidate points generated in the optimization routine
         X_hist = torch.empty([0, dim]).to(dtype=self.dtype, device=self.device)
         y_hist = torch.empty([0, 1]).to(dtype=self.dtype, device=self.device)
         tr_hist = torch.empty([0, 1], dtype=torch.int)
         tr_active = np.arange(n_trust_regions)
         states = []
 
-        # Initial sample
+        # Generate and evaluate initial samples
         if (racqf is not None) and n_init_region > 0:
             for i in tr_active:
                 states.append(TurboState(dim, batch_size=batch_size))
             X_init, y_init = self.evaluate_on_init_points(
                 eval_objective, dim, n_init_region, rng
             )
-            # q Regional Expected Improvement
+            # Sample from the global model using Region averaged acquisition function
             X_turbo, y_turbo = self.sampling_from_global_model(
                 X_init,
                 y_init,

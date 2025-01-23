@@ -379,7 +379,11 @@ class ROM(ABC):
         return outputsPSO
 
     def ErrorCalculation(
-        self, model_parameters, t_span_factor=1.0, validation_mode=False
+        self,
+        model_parameters,
+        t_span_factor=1.0,
+        validation_mode=False,
+        optimize_c=False,
     ):
         if validation_mode:
             data = self.validation_bc
@@ -410,16 +414,32 @@ class ROM(ABC):
             method="Radau",
         )
 
+        testMassTemps = np.vstack([sol.t, sol.y])
         # weighted output
         Y = np.matmul(c, sol.y)
-        # error
-        error = self.WeightedErrorFunction(
-            c,
-            testMassTemps=np.vstack([sol.t, sol.y]),
-            target=new_target_data,
-        )
 
-        return error, sol, Y
+        if self.output_column == "Temp":
+            # Calculate error
+            error = self.WeightedErrorFunction(
+                c,
+                testMassTemps=np.vstack([sol.t, sol.y]),
+                target=new_target_data,
+            )
+
+        elif self.output_column in ["S11", "S12", "S22", "S33"]:
+            if optimize_c:
+                CGuess = np.ones(c.shape[0])
+                optArgs = (testMassTemps, self.target_data)
+                # optimise for C array
+                optSoln = opMin(self.WeightedErrorFunction, CGuess, args=optArgs)
+                # output
+                c = optSoln.x
+
+                Y = np.matmul(c, sol.y)
+            # Calculate the error
+            error = self.WeightedErrorFunction(c, testMassTemps, target=new_target_data)
+
+        return error, sol, c, Y
 
 
 class SiROM(BaseTestProblem):
@@ -436,6 +456,11 @@ class SiROM(BaseTestProblem):
         self.validation_data = pd.read_csv(
             "../data/Abaqus_n28_Interface_Mid_validation.csv", skipinitialspace=True
         )
+
+        # self.training_data = pd.read_csv("../data/Training2.csv", skipinitialspace=True)
+        # self.validation_data = pd.read_csv(
+        #     "../data/Validation2.csv", skipinitialspace=True
+        # )
 
         # initial conditions
         self.nGuess = 3
@@ -463,7 +488,13 @@ class SiROM(BaseTestProblem):
         return qmc.scale(samples, lower_bounds, upper_bounds)
 
     def evaluate_true(
-        self, X, kwargs={"scale_parameters": True, "return_candidates": False}
+        self,
+        X,
+        kwargs={
+            "scale_parameters": True,
+            "return_candidates": False,
+            "optimize_c": True,
+        },
     ):
         candidate_dict = {}
         error_candidates = []
@@ -494,9 +525,19 @@ class SiROM(BaseTestProblem):
             candidate_dict["k"] = np.array([X[j, 2], X[j, 3]])
             candidate_dict["h"] = np.array([X[j, 4], X[j, 5]])
             candidate_dict["c"] = np.array([0.0, 1.0, 0.0])
-            error, _, _ = self.rom.ErrorCalculation(candidate_dict, t_span_factor=1.0)
+            (
+                error,
+                _,
+                c,
+                y,
+            ) = self.rom.ErrorCalculation(
+                candidate_dict, t_span_factor=1.0, optimize_c=kwargs["optimize_c"]
+            )
             error_candidates.append(-1 * error)
             error_tensor = torch.tensor(error_candidates).unsqueeze(-1)
+
+        c = np.expand_dims(c, axis=0)
+        X = np.hstack((X, c))
 
         if kwargs["return_candidates"]:
             return error_tensor, X
