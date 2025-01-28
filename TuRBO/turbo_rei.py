@@ -32,7 +32,11 @@ from gpytorch.kernels import MaternKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
-from .rei import qRegionalExpectedImprovement, LogRegionalExpectedImprovement
+from .rei import (
+    qRegionalExpectedImprovement,
+    qLogRegionalExpectedImprovement,
+    LogRegionalExpectedImprovement,
+)
 
 
 SMOKE_TEST = os.environ.get("SMOKE_TEST")
@@ -543,6 +547,14 @@ class TuRBO:
                     length=length_init,
                     bounds=bounds,
                 )
+            elif racqf == "qLogREI":
+                racq_function = qLogRegionalExpectedImprovement(
+                    X_dev=X_dev,
+                    model=model,
+                    best_f=train_y.max(),
+                    length=length_init,
+                    bounds=bounds,
+                )
 
             # Optimize the acquisition function to generate candidates for TR centres
             candidates, _ = optimize_acqf(
@@ -634,8 +646,8 @@ class TuRBO:
         # Perform fundamental checks regarding acquisition functions
         if n_init_region > 0 and n_trust_regions > 1:
             assert (
-                racqf in ("qREI", "qEI") or racqf is None
-            ), "racqf must be 'qREI', 'qEI', or None for TuRBO-m"
+                racqf in ("qREI", "qLogREI", "qEI") or racqf is None
+            ), "racqf must be 'qREI', 'qLogREI', 'qEI', or None for TuRBO-m"
         else:
             assert (
                 racqf in ("REI", "qREI") or racqf is None
