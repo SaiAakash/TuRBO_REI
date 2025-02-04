@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable, Optional, Union
+from functools import partial
 
 import torch
 from torch import Tensor
@@ -18,7 +19,11 @@ from botorch.acquisition.objective import PosteriorTransform
 from botorch.models.model import Model
 from botorch.utils.safe_math import logmeanexp
 from botorch.utils.transforms import t_batch_mode_transform
-from botorch.acquisition.logei import _log_improvement, check_tau
+from botorch.acquisition.logei import (
+    LogImprovementMCAcquisitionFunction,
+    _log_improvement,
+    check_tau,
+)
 
 TAU_RELU = 1e-6
 TAU_MAX = 1e-2
@@ -133,18 +138,18 @@ class qRegionalExpectedImprovement(MCAcquisitionFunction):
         return q_rei
 
 
-class qLogRegionalExpectedImprovement(MCAcquisitionFunction):
+class qLogRegionalExpectedImprovement(LogImprovementMCAcquisitionFunction):
     def __init__(
         self,
         model: Model,
         best_f: float | Tensor,
-        X_dev: float | Tensor,
+        X_dev: Tensor,
         sampler: MCSampler | None = None,
         objective: MCAcquisitionObjective | None = None,
         posterior_transform: PosteriorTransform | None = None,
         X_pending: Tensor | None = None,
         length: float = 0.8,
-        bounds: float | Tensor | None = None,
+        bounds: Tensor | None = None,
         fat: bool = True,
         tau_relu: float = TAU_RELU,
     ) -> None:
@@ -185,12 +190,17 @@ class qLogRegionalExpectedImprovement(MCAcquisitionFunction):
             posterior_transform=posterior_transform,
             X_pending=X_pending,
         )
+        # adding + 1 to account for the additional MC sampling dimension
+        # for points inside the trust region surrounding `X`
+        sample_dim = tuple(range(len(self.sample_shape) + 1))
+        self._sample_reduction = partial(logmeanexp, dim=sample_dim)
+
         self.register_buffer("best_f", torch.as_tensor(best_f, dtype=float))
         self.fat: bool = fat
         self.tau_relu: float = check_tau(tau_relu, "tau_relu")
         dim: int = X_dev.shape[1]
         self.n_region: int = X_dev.shape[0]
-        self.X_dev: Tensor = X_dev.reshape(self.n_region, 1, 1, -1)
+        self.X_dev: Tensor = X_dev
         self.length: float = length
         if bounds is not None:
             self.bounds = bounds
@@ -199,26 +209,54 @@ class qLogRegionalExpectedImprovement(MCAcquisitionFunction):
                 device=self.X_dev.device, dtype=self.X_dev.dtype
             )
 
-    @concatenate_pending_points
-    @t_batch_mode_transform()
-    def forward(self, X: Tensor) -> Tensor:
-        batch_shape = X.shape[0]
-        q = X.shape[1]
+    def _get_samples_and_objectives(self, X: Tensor) -> tuple[Tensor, Tensor]:
+        """Computes posterior samples and objective values at input X.
+
+        This is required in order to munge X and create samples within a TR
+        and compute the MC objective over these points. This is then later
+        passed to the _sample_forward function to compute the Log Regional
+        Expected Improvement acqusition function value.
+
+        Args:
+            X: A `batch_shape x q x d`-dim Tensor of model inputs.
+
+        Returns:
+            A two-tuple `(samples, obj)`, where `samples` is a tensor of posterior
+            samples with shape `sample_shape x n_region x batch_shape x q x m`,
+            and `obj` is a tensor of MC objective values with shape
+            `sample_shape x n_region x batch_shape x q`.
+        """
+        # region-averaged EI specific code
+        batch_shape = X.shape[:-2]
         d = X.shape[2]
 
         # make N_x samples in design space
         X_min = (X - 0.5 * self.length).clamp_min(self.bounds[0]).unsqueeze(0)
         X_max = (X + 0.5 * self.length).clamp_max(self.bounds[1]).unsqueeze(0)
-        Xs = (self.X_dev * (X_max - X_min) + X_min).reshape(-1, q, d)
 
-        posterior = self.model.posterior(
-            X=Xs, posterior_transform=self.posterior_transform
+        # n_region x (1, ..., 1) x 1 x d
+        X_dev = self.X_dev.reshape(
+            (self.n_region,) + (tuple(1 for _ in batch_shape) + (1, d))
         )
-        samples = self.get_posterior_samples(posterior)
-        obj = self.objective(samples, X=Xs)
-        obj = _log_improvement(obj, self.best_f, self.tau_relu, self.fat).reshape(
-            -1, self.n_region, batch_shape, q
-        )
-        q_log_rei = obj.max(dim=-1)[0].mean(dim=(0, 1))
+        # n_region x batch_shape x q x d
+        Xs = X_dev * (X_max - X_min) + X_min
 
-        return q_log_rei
+        # calling the original method with the modified inputs
+        return super()._get_samples_and_objectives(Xs)
+
+    def _sample_forward(self, obj: Tensor) -> Tensor:
+        r"""Evaluate qLogExpectedImprovement on the candidate set `X`.
+
+        Args:
+            obj: `mc_shape x batch_shape x q`-dim Tensor of MC objective values.
+
+        Returns:
+            A `mc_shape x batch_shape x q`-dim Tensor of expected improvement values.
+        """
+        li = _log_improvement(
+            Y=obj,
+            best_f=self.best_f,
+            tau=self.tau_relu,
+            fat=self._fat,
+        )
+        return li

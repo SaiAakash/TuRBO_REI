@@ -23,6 +23,7 @@ from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
 from botorch.utils.transforms import unnormalize
 from botorch.models.transforms.outcome import Standardize
+from botorch.models.utils.gpytorch_modules import get_covar_module_with_dim_scaled_prior
 from botorch.sampling.normal import SobolQMCNormalSampler
 import gpytorch
 from gpytorch.priors.torch_priors import GammaPrior
@@ -210,7 +211,8 @@ class TuRBO:
 
         # Scale the TR to be proportional to the lengthscales in the respective dimensions
         x_center = X[Y.argmax(), :].clone()
-        weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
+        # weights = model.covar_module.base_kernel.lengthscale.squeeze().detach()
+        weights = model.covar_module.lengthscale.squeeze().detach()
         weights = weights / weights.mean()
         weights = weights / torch.prod(weights.pow(1.0 / len(weights)))
         tr_lb = torch.clamp(x_center - weights * state.length / 2.0, 0.0, 1.0)
@@ -374,15 +376,21 @@ class TuRBO:
             noise_constraint=Interval(noise_constraint[0], noise_constraint[1])
         )
         # Define the Kernel function of the GP Model
-        covar_module = (
-            ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
-                MaternKernel(
-                    nu=2.5,
-                    ard_num_dims=dim,
-                    lengthscale_constraint=Interval(0.005, 4.0),
-                )
-            )
+        # covar_module = (
+        #     ScaleKernel(  # Use the same lengthscale prior as in the TuRBO paper
+        #         MaternKernel(
+        #             nu=2.5,
+        #             ard_num_dims=dim,
+        #             lengthscale_constraint=Interval(0.005, 4.0),
+        #         )
+        #     )
+        # )
+
+        covar_module = get_covar_module_with_dim_scaled_prior(
+            ard_num_dims=dim,
+            use_rbf_kernel=False,
         )
+
         # Define the GP model and the training objective
         model = SingleTaskGP(
             X_turbo[mask],
@@ -487,13 +495,18 @@ class TuRBO:
         train_y = (y_hist - y_hist.mean()) / y_hist.std()
 
         # Setup the Kernel function for the Global GP model
-        covar_module = MaternKernel(
-            nu=2.5,
-            ard_num_dims=X_hist.shape[-1],
-            lengthscale_prior=GammaPrior(3.0, 6.0),
-        )
-        covar_module = ScaleKernel(
-            covar_module, outputscale_prior=GammaPrior(2.0, 0.15)
+        # covar_module = MaternKernel(
+        #     nu=2.5,
+        #     ard_num_dims=X_hist.shape[-1],
+        #     lengthscale_prior=GammaPrior(3.0, 6.0),
+        # )
+
+        # covar_module = ScaleKernel(
+        #     covar_module, outputscale_prior=GammaPrior(2.0, 0.15)
+        # )
+
+        covar_module = get_covar_module_with_dim_scaled_prior(
+            ard_num_dims=X_hist.shape[-1], use_rbf_kernel=False
         )
 
         # Setup the likelihood of the global GP model
@@ -650,7 +663,7 @@ class TuRBO:
             ), "racqf must be 'qREI', 'qLogREI', 'qEI', or None for TuRBO-m"
         else:
             assert (
-                racqf in ("REI", "qREI") or racqf is None
+                racqf in ("REI", "qREI", "qLogREI") or racqf is None
             ), "racqf must be 'REI', 'qREI', or None"
 
         t0 = time.perf_counter()

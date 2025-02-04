@@ -48,6 +48,10 @@ class ROM(ABC):
             "h1": self.hrange1,
             "h2": self.hrange2,
         }
+        # if output_column in ["S11", "S12", "S22", "S33"]:
+        #     self.expanded_params_range["c1"] = [-1.0, 1.0]
+        #     self.expanded_params_range["c2"] = [-1.0, 1.0]
+        #     self.expanded_params_range["c3"] = [-1.0, 1.0]
         self.pso_kwargs = pso_kwargs
 
     def dTdtLinear(self, t, y, mArray, kArray, hArray, BCArray):
@@ -422,7 +426,7 @@ class ROM(ABC):
             # Calculate error
             error = self.WeightedErrorFunction(
                 c,
-                testMassTemps=np.vstack([sol.t, sol.y]),
+                testMassTemps=testMassTemps,
                 target=new_target_data,
             )
 
@@ -437,7 +441,9 @@ class ROM(ABC):
 
                 Y = np.matmul(c, sol.y)
             # Calculate the error
-            error = self.WeightedErrorFunction(c, testMassTemps, target=new_target_data)
+            error = self.WeightedErrorFunction(
+                c, testMassTemps=testMassTemps, target=new_target_data
+            )
 
         return error, sol, c, Y
 
@@ -446,6 +452,12 @@ class SiROM(BaseTestProblem):
     def __init__(self, problem, dim=6, noise_std=None, negate=True):
         self.problem = problem
         self.dim = dim
+        # if problem == "Temp":
+        #     self.dim = 6
+        # elif problem in ["S11", "S12", "S22", "S33"]:
+        #     self.dim = 9
+        # else:
+        #     raise ValueError("Invalid problem name")
         self._bounds = np.vstack((np.zeros(self.dim), np.ones(self.dim))).T
         super().__init__(noise_std=noise_std, negate=negate)
 
@@ -457,14 +469,13 @@ class SiROM(BaseTestProblem):
             "../data/Abaqus_n28_Interface_Mid_validation.csv", skipinitialspace=True
         )
 
-        # self.training_data = pd.read_csv("../data/Training2.csv", skipinitialspace=True)
-        # self.validation_data = pd.read_csv(
-        #     "../data/Validation2.csv", skipinitialspace=True
-        # )
-
         # initial conditions
-        self.nGuess = 3
-        self.initialTempsGuess = np.ones(self.nGuess) * 20
+        nGuess = 3
+        # if self.problem == "Temp":
+        #     self.initialTempsGuess = np.ones(nGuess) * 20
+        # elif self.problem in ["S11", "S12", "S22", "S33"]:
+        #     self.initialTempsGuess = np.zeros(nGuess)
+        self.initialTempsGuess = np.ones(nGuess) * 20
 
         # Set the parameter ranges
         self.params_range = {
@@ -524,6 +535,10 @@ class SiROM(BaseTestProblem):
             candidate_dict["m"] = np.array([X[j, 0], 1.0, X[j, 1]])
             candidate_dict["k"] = np.array([X[j, 2], X[j, 3]])
             candidate_dict["h"] = np.array([X[j, 4], X[j, 5]])
+            # if self.problem in ["S11", "S12", "S22", "S33"]:
+            #     candidate_dict["c"] = np.array([X[j, 6], X[j, 7], X[j, 8]])
+            # else:
+            #     candidate_dict["c"] = np.array([0.0, 1.0, 0.0])
             candidate_dict["c"] = np.array([0.0, 1.0, 0.0])
             (
                 error,
@@ -536,8 +551,9 @@ class SiROM(BaseTestProblem):
             error_candidates.append(-1 * error)
             error_tensor = torch.tensor(error_candidates).unsqueeze(-1)
 
-        c = np.expand_dims(c, axis=0)
-        X = np.hstack((X, c))
+        if self.dim == 6:
+            c = np.expand_dims(c, axis=0)
+            X = np.hstack((X, c))
 
         if kwargs["return_candidates"]:
             return error_tensor, X
